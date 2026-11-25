@@ -1,186 +1,285 @@
-# B. 数据库 Schema 骨架（MySQL 优先，仓储接口抽象）
+# B. 数据库 Schema（修订稿，对应 D1–D63）
 
-> 依据：D7（全量存储+每节点落库，ADR-0003）、D18（token 明细）、D20（Conversation）、D31（Node Binding）、ADR-0008（密钥两种模式）。
-> 原则：字符集 utf8mb4；主键用 UUID（引擎生成）；JSON 列用 MySQL `JSON` 类型；跨服务不建物理外键（租户主数据在控制面库）；高频表（events、token_usage、node_runs）按月分区预留。
-> 边界说明：工作流定义的**写入口**是控制面服务，但定义数据存引擎库（导入校验/静态引用校验在引擎），控制面经引擎管理 API 写入——单库部署简单，后续可拆。
+> 依据：D7、D33–D38、D43、D45、D48、D50、D53–D56、D58、D61、D63。决策原文见 `docs/grill-record.md`。
+> 原则：utf8mb4；主键 UUID（引擎生成）；JSON 列用 MySQL `JSON`；跨服务不建物理外键（租户主数据在控制面库）；高频表按月分区预留。
+> 执行用的配置只存引擎库，控制面经引擎的管理 API 读写（D34，ADR-0013）。
+> 凡是「一次节点执行」都用 `node_run_id` 标识（D38）：迭代的一个元素、循环的一轮各算一次，重试算同一次。
+> 标「待 Round 9」的地方等设计定了再补。
 
-## 1. 工作流定义
+## 1. 工作流定义与版本（D33、D53、D54、D58）
 
 ```sql
 workflows (
-  id            UUID PK,
-  tenant_id     VARCHAR(64) NOT NULL,
-  name          VARCHAR(255) NOT NULL,
-  current_version_id UUID NULL,          -- 指向 workflow_versions
+  id                 UUID PK,
+  tenant_id          VARCHAR(64) NOT NULL,
+  name               VARCHAR(255) NOT NULL,
+  current_version_id UUID NULL,          -- 当前已发布的版本；为空表示还没有已发布版本
   created_at / updated_at
 )
--- index: (tenant_id)
 
 workflow_versions (
-  id            UUID PK,
-  workflow_id   UUID NOT NULL,
-  version       INT NOT NULL,             -- 递增
-  dsl_yaml      MEDIUMTEXT NOT NULL,      -- 原始 DSL（审计/重导入）
-  graph_ir      JSON NOT NULL,            -- 解析后的内部图表示（导入产物）
-  import_report JSON NOT NULL,            -- unsupported 清单、校验错误、绑定建议
-  checksum      CHAR(64) NOT NULL,
-  created_by    VARCHAR(64), created_at,
+  id                 UUID PK,
+  workflow_id        UUID NOT NULL,
+  version            INT NOT NULL,       -- 递增
+  definition         JSON NOT NULL,      -- Workflow Definition：Dify DSL 0.7.0 的结构 + 扩展命名空间
+  source_dsl         MEDIUMTEXT NULL,    -- 原始的 Dify 导出文件，只有导入的版本才有
+  status             ENUM('draft','published') NOT NULL,
+  import_report      JSON NULL,          -- 阻断项与提示（错误级的导入已被拒绝，不会留在这里）
+  model_mapping      JSON NULL,          -- 导入时用的模型映射规则和解析结果
+  resolved_bindings  JSON NULL,          -- 发布时冻结的 Node Binding 解析结果
+  compiled           JSON NULL,          -- 发布时生成的内部图表示，是定义的派生物
+  published_at       DATETIME NULL,
+  checksum           CHAR(64) NOT NULL,
+  created_by VARCHAR(64), created_at,
   UNIQUE (workflow_id, version)
 )
 ```
 
-## 2. 执行记录（每节点落库，ADR-0003）
+- 草稿可以原地更新；发布后不再改变，要改就从已发布版本派生新草稿。
+- 环境变量在 `definition` 里，随版本一起冻结（D58）。导入时值为空的 secret 类型变量已经换成 `{{secret.变量名}}`。
+- 只有已发布的版本能被调用；`POST /invocations` 不带版本号时取 `current_version_id`。
+
+## 2. 执行记录（D36、D38、D54、D55）
 
 ```sql
 invocations (
-  id                 UUID PK,             -- = invocation_id
-  tenant_id          VARCHAR(64) NOT NULL,
-  user_id            VARCHAR(64) NOT NULL,
-  conversation_id    UUID NULL,           -- chatflow 多轮时挂 Conversation
-  workflow_id        UUID NOT NULL,
-  workflow_version_id UUID NOT NULL,
-  status ENUM('pending','running','waiting_input','paused',
-              'succeeded','failed','cancelled') NOT NULL,
-  idempotency_key    VARCHAR(128) NULL,   -- D3
-  trigger_source     VARCHAR(32) NOT NULL DEFAULT 'api',  -- api | trigger 映射
-  inputs             JSON, outputs        JSON, error JSON,
-  parent_invocation_id UUID NULL,         -- sub-workflow 派生关系（D11）
-  depth              TINYINT DEFAULT 0,   -- 子工作流深度（默认上限 5，D29）
+  id                    UUID PK,         -- invocation_id
+  tenant_id             VARCHAR(64) NOT NULL,
+  user_id               VARCHAR(64) NOT NULL,
+  workflow_id           UUID NOT NULL,
+  workflow_version_id   UUID NOT NULL,   -- 已发布的版本
+  conversation_id       UUID NULL,       -- Conversation 绑定单一工作流；不传则没有会话变量和记忆
+  parent_invocation_id  UUID NULL,       -- sub-workflow 派生关系
+  parent_node_run_id    UUID NULL,       -- 父工作流里派生它的那次节点执行
+  depth                 TINYINT NOT NULL DEFAULT 0,   -- 默认上限 5
+  status                ENUM('pending','running','waiting_input','paused',
+                             'succeeded','failed','cancelled') NOT NULL,
+  idempotency_key       VARCHAR(128) NULL,
+  idempotency_expires_at DATETIME NULL,  -- 保留期可配
+  trigger_source        VARCHAR(32) NOT NULL DEFAULT 'api',
+  inputs                JSON, outputs JSON, error JSON,
+  config_snapshot       JSON NULL,       -- 调用开始时解析到的共享运行配置（Provider 配置、Capability、密钥）
+  time_limit_ms         BIGINT NULL,     -- 整个工作流的执行时间上限
+  running_time_ms       BIGINT NOT NULL DEFAULT 0,   -- 只累计运行中的时间
   started_at / finished_at / created_at / updated_at,
   UNIQUE (tenant_id, workflow_id, idempotency_key),
   index: (tenant_id, created_at), (conversation_id), (parent_invocation_id), (status)
 )
 
 node_runs (
-  id            UUID PK,
-  invocation_id UUID NOT NULL,
-  node_id       VARCHAR(64) NOT NULL,     -- Dify 节点 id 原样保留
-  node_type     VARCHAR(64) NOT NULL,
-  attempt       INT NOT NULL DEFAULT 1,   -- 重试次数（D19）
-  status ENUM('running','succeeded','failed','skipped','waiting') NOT NULL,
-  error         JSON, outputs JSON,
+  id                   UUID PK,          -- node_run_id，跨重启稳定，重跑时沿用
+  invocation_id        UUID NOT NULL,
+  parent_node_run_id   UUID NULL,        -- 容器（迭代的一个元素、循环的一轮）本身也是一次节点执行
+  node_id              VARCHAR(64) NOT NULL,
+  node_type            VARCHAR(64) NOT NULL,
+  attempt              INT NOT NULL DEFAULT 1,
+  status               ENUM('running','succeeded','failed','skipped','waiting','cancelled','unknown') NOT NULL,
+  inputs JSON, outputs JSON, error JSON,
+  child_invocation_id  UUID NULL,        -- sub-workflow 节点派生的子 Invocation
   started_at / finished_at,
-  index: (invocation_id, node_id, attempt)
+  index: (invocation_id, parent_node_run_id, node_id)
 )
 
-node_snapshots (                             -- 变量快照（断点续跑依据）
-  id            BIGINT AUTO PK,
-  invocation_id UUID NOT NULL,
-  after_node_id VARCHAR(64) NOT NULL,      -- 该节点完成后的上下文快照
-  context       JSON NOT NULL,             -- 全量快照起步；优化期改 增量+定期全量
+node_snapshots (                           -- 变量快照，只用于续跑
+  id               BIGINT AUTO PK,
+  invocation_id    UUID NOT NULL,
+  node_run_id      UUID NOT NULL,         -- 这次快照是哪次节点执行之后的状态
+  context          JSON NOT NULL,         -- 全量快照起步，优化期改增量 + 定期全量
   created_at,
   index: (invocation_id)
 )
 
-waiting_inputs (                             -- human-input 挂起（"待我审批"查询）
-  invocation_id UUID NOT NULL,
-  node_id       VARCHAR(64) NOT NULL,
-  actions       JSON NOT NULL,             -- user_actions（对齐 Dify）
-  form_schema   JSON NULL,
-  timeout_at    DATETIME NULL,             -- __timeout 分支依据
-  status        ENUM('waiting','resolved','timeout','cancelled') NOT NULL,
-  resolved_by   VARCHAR(64) NULL, resolved_at DATETIME NULL,
-  PK (invocation_id, node_id)
+waiting_inputs (                           -- 人工输入的等待记录
+  node_run_id     UUID PK,                -- 循环里每一轮的等待各是一条
+  invocation_id   UUID NOT NULL,
+  node_id         VARCHAR(64) NOT NULL,
+  actions         JSON NOT NULL,          -- user_actions
+  form_schema     JSON NULL,
+  assignees       JSON NULL,              -- 可选，不透明的 user/role 引用
+  remind_at       DATETIME NULL,          -- 提醒时限，可以不配
+  reminded_at     DATETIME NULL,
+  timeout_at      DATETIME NULL,          -- 超时时限，到期走 __timeout 分支
+  status          ENUM('waiting','resolved','timeout','cancelled') NOT NULL,
+  resolved_by     VARCHAR(64) NULL, resolved_at DATETIME NULL,
+  index: (invocation_id), (status, remind_at), (status, timeout_at)
 )
 
-events (                                     -- SSE 事件落库（D13，Last-Event-ID 回放）
-  id            BIGINT AUTO PK,
-  invocation_id UUID NOT NULL,
-  seq           BIGINT NOT NULL,            -- invocation 内单调递增
-  type          VARCHAR(32) NOT NULL,       -- 11 类事件（见 api-spec.md）
-  node_id       VARCHAR(64) NULL,
-  payload       JSON,
+events (                                   -- 只有结构性事件落库
+  id             BIGINT AUTO PK,
+  invocation_id  UUID NOT NULL,
+  seq            BIGINT NOT NULL,         -- Invocation 内单调递增
+  type           VARCHAR(32) NOT NULL,
+  node_run_id    UUID NULL,
+  payload        JSON,
   created_at,
   UNIQUE (invocation_id, seq)
 )
 ```
 
-## 3. 会话（D20）
+- 节点开始时先写一行 `status = running` 再执行。进程重启后，这些还没有终态的行就是在途节点，按配置的在途策略处理（本期：重跑，ADR-0011）。
+- 幂等键随节点执行下发：HTTP 出站请求带上由 `node_run_id` 派生的幂等头。
+- `llm_delta`、`answer_delta` 不写 `events` 表（D37，ADR-0012）。
+- 重启时处于 `running` 的 Invocation 自动续跑；处于 `paused` 的保持暂停（D36、D49）。
+
+## 3. 会话（D50、D56）
 
 ```sql
 conversations (
-  id         UUID PK,                       -- conversation_id，控制面分配
-  tenant_id  VARCHAR(64) NOT NULL,
-  user_id    VARCHAR(64) NOT NULL,
-  metadata   JSON, created_at
+  id           UUID PK,                   -- conversation_id，控制面按「Session × Workflow」分配
+  tenant_id    VARCHAR(64) NOT NULL,
+  workflow_id  UUID NOT NULL,             -- 一个 Conversation 只属于一个工作流
+  user_id      VARCHAR(64) NOT NULL,
+  session_ref  VARCHAR(128) NULL,         -- dsh Session 的不透明引用，只用于排查
+  created_at
 )
+
 conversation_variables (
-  conversation_id UUID NOT NULL,
-  name            VARCHAR(128) NOT NULL,
-  value           JSON,
+  conversation_id     UUID NOT NULL,
+  name                VARCHAR(128) NOT NULL,
+  value               JSON,
   updated_by_invocation UUID,
   updated_at,
   PK (conversation_id, name)
 )
+
+conversation_turns (                       -- 对话轮次；节点配置了 memory 才会被读取
+  conversation_id UUID NOT NULL,
+  invocation_id   UUID NOT NULL,
+  turn_no         INT NOT NULL,
+  query           MEDIUMTEXT,
+  answer          MEDIUMTEXT,
+  files           JSON NULL,              -- 这一轮涉及的 File 引用
+  created_at,
+  PK (conversation_id, invocation_id),
+  index: (conversation_id, turn_no)
+)
 ```
 
-## 4. Capability 与密钥（D9 / D17 / ADR-0008）
+- 同一个 Conversation 里的 Invocation 串行，但只在工作流声明了会话变量时才排队。
+- 会话变量在该 Conversation 第一次被使用时，按当时版本的声明初始化默认值。
+
+## 4. Capability、Provider 配置与密钥（D9、D35、D43）
 
 ```sql
 capabilities (
-  id         UUID PK,
-  tenant_id  VARCHAR(64) NULL,              -- NULL = 全局能力
-  name       VARCHAR(128) NOT NULL,
-  version    INT NOT NULL,
-  spec       JSON NOT NULL,  -- method/url/headers 模板/auth 类型/超时/重试/输入输出 schema/{{secret.*}} 占位符
-  enabled    BOOL DEFAULT TRUE,
+  id          UUID PK,
+  tenant_id   VARCHAR(64) NULL,           -- NULL = 全局能力
+  name        VARCHAR(128) NOT NULL,
+  version     INT NOT NULL,
+  spec        JSON NOT NULL,              -- method / url / headers / auth / 超时 / 重试 / 输入输出 schema
+                                          -- 密钥一律写 {{secret.name}}
+                                          -- 文件参数怎么传（内联 / 预签名地址）待 Round 9
+  enabled     BOOL DEFAULT TRUE,
   created_at / updated_at,
   UNIQUE (tenant_id, name, version)
 )
-capability_bindings (                       -- http-tool 节点 → capability 版本引用
-  id UUID PK, tenant_id, node_ref VARCHAR(128), capability_id UUID, capability_version INT
+
+provider_configs (
+  id          UUID PK,
+  tenant_id   VARCHAR(64) NULL,           -- NULL = 全局
+  name        VARCHAR(128) NOT NULL,
+  adapter     VARCHAR(64) NOT NULL,       -- 协议模式，如 openai-compatible
+  base_url    VARCHAR(512) NOT NULL,
+  api_key     VARCHAR(512) NOT NULL,      -- 一律是 {{secret.name}}
+  models      JSON NOT NULL,              -- 可用模型与别名
+  extra       JSON NULL,
+  enabled     BOOL DEFAULT TRUE,
+  created_at / updated_at,
+  UNIQUE (tenant_id, name)
 )
 
-secrets (                                    -- 仅"静态模式"；占位符模式的真值在网关侧
+secrets (                                   -- 只在 local 部署档位存在
   id          UUID PK,
   tenant_id   VARCHAR(64) NOT NULL,
   name        VARCHAR(128) NOT NULL,
-  ciphertext  VARBINARY NOT NULL,            -- AES-GCM（ADR-0008 两种模式并存）
+  ciphertext  VARBINARY NOT NULL,          -- AES-GCM
   key_version INT NOT NULL,
   created_at / updated_at,
   UNIQUE (tenant_id, name)
 )
 ```
 
-## 5. Node Binding（D31，ADR-0009）
+- `gateway` 档下引擎不持有密钥，没有 `secrets` 的内容（ADR-0008）。
+- Capability 和 Provider 配置不随版本冻结，在调用开始时解析，结果记在 `invocations.config_snapshot`。
+
+## 5. Node Binding（D54，ADR-0014）
 
 ```sql
 node_bindings (
-  id            UUID PK,
-  tenant_id     VARCHAR(64) NOT NULL,
-  scope         ENUM('type','instance') NOT NULL,
-  node_type     VARCHAR(64) NULL,           -- scope=type 时必填（如 knowledge-retrieval）
-  workflow_id   UUID NULL,                  -- scope=instance 时必填
-  node_id       VARCHAR(64) NULL,           -- scope=instance 时必填
-  target        VARCHAR(255) NOT NULL,      -- builtin | capability:{id} | custom:{ref}
-  config        JSON,
+  id           UUID PK,
+  tenant_id    VARCHAR(64) NOT NULL,
+  scope        ENUM('type','instance') NOT NULL,
+  node_type    VARCHAR(64) NULL,          -- scope=type 时必填
+  workflow_id  UUID NULL,                 -- scope=instance 时必填
+  node_id      VARCHAR(64) NULL,
+  target       VARCHAR(255) NOT NULL,     -- 引擎里已注册的实现，或 capability:{id}
+  config       JSON,
   created_at / updated_at,
   UNIQUE (tenant_id, scope, IFNULL(node_type,''), IFNULL(workflow_id,''), IFNULL(node_id,''))
 )
 ```
 
-## 6. token 统计（D18：只记 token 数 + model/provider）
+这张表存的是配置。类型级绑定只对配置里不带目标地址的节点类型开放（knowledge-retrieval、document-extractor、code、template-transform、human-input）。发布时把解析结果写进 `workflow_versions.resolved_bindings`，之后改绑定不影响已发布的版本。
+
+## 6. 文件（D57、D61；传递方式待 Round 9）
+
+```sql
+files (
+  id            UUID PK,
+  tenant_id     VARCHAR(64) NOT NULL,
+  invocation_id UUID NULL,                -- 由哪次调用产出；控制面上传的为空
+  name          VARCHAR(255) NOT NULL,
+  mime_type     VARCHAR(128) NOT NULL,
+  size          BIGINT NOT NULL,
+  storage_key   VARCHAR(512) NOT NULL,    -- 文件存储里的键，前缀按租户和 Invocation 划分
+  sha256        CHAR(64) NULL,
+  created_at,
+  expires_at                              -- 产出文件默认留 7 天
+)
+index: (tenant_id, created_at), (invocation_id), (expires_at)
+```
+
+File 在变量里一律是引用：`{name, mime_type, size, url}`。文件存储是可插拔的（对象存储；本地开发用本地目录）。引擎和外部服务之间怎么传文件，待 Round 9。
+
+## 7. token 统计（D18）
 
 ```sql
 token_usage (
-  id              BIGINT AUTO PK,
-  tenant_id       VARCHAR(64) NOT NULL,
-  user_id         VARCHAR(64) NOT NULL,
-  invocation_id   UUID NOT NULL,
-  node_id         VARCHAR(64) NOT NULL,
-  provider        VARCHAR(64) NOT NULL,
-  model           VARCHAR(128) NOT NULL,
+  id                BIGINT AUTO PK,
+  tenant_id         VARCHAR(64) NOT NULL,
+  user_id           VARCHAR(64) NOT NULL,
+  invocation_id     UUID NOT NULL,
+  node_run_id       UUID NOT NULL,
+  provider          VARCHAR(64) NOT NULL,  -- 解析后的 Provider 配置名
+  model             VARCHAR(128) NOT NULL,
   prompt_tokens     BIGINT NOT NULL DEFAULT 0,
   completion_tokens BIGINT NOT NULL DEFAULT 0,
   total_tokens      BIGINT NOT NULL DEFAULT 0,
+  raw_usage         JSON NULL,             -- 厂商返回的原始 usage
   latency_ms        INT,
   status            VARCHAR(16),
   created_at,
   index: (tenant_id, created_at), (invocation_id), (tenant_id, model, created_at)
-  -- 成本 = 查询时按价格表版本换算，不在本表落库（D18）
 )
 ```
 
-## 7. 队列（D10）
+不做成本换算。
 
-内存队列为主实现；多实例时换 Redis Stream / MQ。队列状态**不落 MySQL**（执行时态在内存 + invocations.status 可重建），重启续跑靠 node_runs + node_snapshots 扫描 pending 节点。
+## 8. 留存（D63）
+
+| 数据 | 默认保留 | 说明 |
+|---|---|---|
+| 变量快照 `node_snapshots` | Invocation 进入终态即删除 | 只用于续跑 |
+| 调用记录、节点执行记录、事件、对话轮次 | 180 天 | 事后排查依据节点执行记录里的输入输出 |
+| token 明细 `token_usage` | 2 年 | 财务依据 |
+| 产出文件 `files` | 7 天 | 控制面上传的文件另算 |
+| 幂等键 | 可配，到期清理 | |
+
+都可按租户覆盖，由清理任务执行。
+
+## 9. 队列与实例（D46、D47）
+
+- 内存队列，本期只支持单实例。多实例之前单独设计。
+- 保证三条约束：Invocation 状态不只活在内存；广播是落库事件之上的优化；队列任务按 invocation_id 路由。
+- 准入控制：运行中上限、队列长度上限（超限回 429）、可选的租户级并发上限。队列先进先出。
+- 重启续跑靠 `invocations.status`、`node_runs` 和 `node_snapshots` 重建，队列状态不落库。
