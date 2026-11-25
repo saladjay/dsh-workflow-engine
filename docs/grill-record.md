@@ -1305,3 +1305,29 @@ HTTP 节点产出文件、Office 服务读写文件，都会碰到同一个问�
 ### ❓ Y4 - **实现语言与调用方式**（未问）
 
 C# 独立服务、Python worker、Rust 内置之间怎么选，等 F7、F8 的事实到了再问。
+
+---
+
+## 交付文档修订（2026-11-26，用户就寝前）
+
+用户睡前要求把能做完的做完并提交。四份交付文档按 D1–D63 重写了一遍，原来的「已知过时点」清单不再需要：
+
+| 文档 | 主要变化 |
+|---|---|
+| `docs/db-schema.md` | `dsl_yaml` 换成 `definition`；版本有 draft / published；Node Run 身份；在途节点的状态；会话绑定工作流、对话轮次表；Provider 配置表；文件表；留存策略；撤回多实例的说法 |
+| `docs/api-spec.md` | 暂停与恢复的语义；`timeout_ms` 只算运行时间；长轮询；定义与发布的 API；Node Binding 的 API；Provider 配置与密钥的 API；事件信封带 `node_run_id`、回放只含结构性事件；导入三级严重度 |
+| `docs/dify-node-mapping.md` | 版本区间与 `.ifpkg`；`end` 的更正；模型映射与记忆；知识检索默认是阻断项；环境变量；应用类型的处理；完整的导入流程 |
+| `docs/milestones.md` | Node Binding 路由提前；新增「定义与发布」「文件」两条线；补 dsh 接入线；准入控制与留存 |
+
+**修订稿里我方做主的实现级细节**（没有单独出题，不同意再改）：
+
+1. 事件新增三个：`waiting_input_reminder`（提醒时限到）、`invocation_paused`、`invocation_resumed`。
+2. 类型级绑定的 API 改为 `PUT /node-bindings/defaults`。初稿把它挂在单个工作流下（`PUT /workflows/{id}/bindings`），和「类型级」的语义对不上。
+3. 删掉 `capability_bindings` 表：节点对 Capability 的引用已经在定义里。
+4. 对话轮次单独一张表 `conversation_turns`。
+5. 节点执行记录的状态里有 `unknown`，对应 D36 预留的「挂起待裁决」。
+6. Dify 0.7.0 新增的 `agent` 应用模式按错误级处理，文档里标了「待确认」。
+7. crate 划分里新增 engine-publish、engine-egress、engine-conversation、engine-files，并注明是实现期建议。
+8. 节点映射表加了一节「一致性验证」，作为实现期建议。
+
+**文档里标「待 Round 9」的部分**：文件怎样在引擎与外部服务之间传、文档节点的形态与实现、dsh 接入线的验收。
