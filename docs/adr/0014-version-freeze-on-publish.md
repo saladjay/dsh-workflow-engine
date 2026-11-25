@@ -1,0 +1,19 @@
+# 版本发布即冻结
+
+Workflow Version 分草稿与已发布。发布由控制面显式触发，条件是没有「阻断项」；发布时每个节点的 Node Binding 被解析成具体实现并冻结在版本里，引擎同时校验绑定目标满足该节点类型的输入输出契约。改了绑定要重新发布才生效，类型级绑定的「全局切换」等于批量重新发布。与此相对，共享运行配置（Provider 配置、Capability 定义、密钥）不随版本冻结：在调用开始时解析，并给这次 Invocation 留一份快照，挂起多日后恢复仍用快照。
+
+## Considered Options
+
+- 绑定在调用开始时解析（全局切换即时生效，在途的 Invocation 不受影响）：方便，但一个配错的类型级绑定会立刻波及所有工作流的新调用，且没有校验时机 → 否决
+- 绑定实时查询：挂起中的 Invocation 恢复后实现可能已经换了 → 否决
+- Capability 版本也在发布时钉死：Capability 是共享的 API 定义，改一次要逐个工作流升级才能生效，太重 → 否决，按调用解析
+
+## Consequences
+
+- 已发布的版本对「用了哪个实现」是完全可复现的；对共享配置的复现依赖 Invocation 上的快照
+- Capability 改了输入 schema 而节点配置没跟上时，调用在开始时失败——这是共享配置不冻结的代价，须给出明确的错误
+- 类型级绑定只对配置里不带目标地址的节点类型开放（knowledge-retrieval、document-extractor、code、template-transform、human-input）；http-request 和 tool 每个节点各有自己的地址，只允许实例级
+
+## 修订
+
+- 2026-11-26：环境变量属于工作流定义，随版本冻结；导入时值为空的 secret 类型变量转成密钥占位符，真实值走密钥库或网关（grill Round 7 W4）。
