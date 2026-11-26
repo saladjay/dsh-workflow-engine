@@ -7,25 +7,33 @@
 ### 工作流定义
 
 **Workflow Definition（工作流定义）**:
-一个工作流「长什么样」的正式描述：图（节点与边）、变量声明与应用级特性，是画布编辑、引擎校验和执行的唯一依据。结构以 **Dify DSL** 为底，自有节点类型放在其上的扩展命名空间里。
+一个工作流「长什么样」的正式描述：图（节点与边）、变量声明与应用级特性，是引擎校验和执行的唯一依据；在 dsh 里，它由控制面从 **Canvas Graph** 转换而来。结构以 **Dify DSL** 为底，自有节点类型放在其上的扩展命名空间里。
 _Avoid_: IR / graph_ir 充当「定义」（它们是定义的派生物）、原生 DSL、内部格式
 
 **Workflow Version（工作流版本）**:
-**Workflow Definition** 的一个具名快照，分草稿与已发布两种状态；已发布的版本不再改变，**Invocation** 总是针对某个已发布的版本执行。
+**Workflow Definition** 的一个具名快照，有三种状态：草稿可以改；已发布的版本不再改变，同一时刻每个工作流最多一个；已下线的版本发布过，不再接受新的调用，可以重新发布。**Invocation** 总是针对某个已发布的版本开始。
 _Avoid_: 用「工作流」指代某个具体版本
+
+**Unpublish（下线）**:
+让当前已发布的 **Workflow Version** 不再接受新的 **Invocation**：在途的照常跑完，之后可以重新发布，回滚就是这么做的。发布新版本时，旧的那个自动下线。下线不改变版本的内容，也不是删除。
+_Avoid_: 把下线叫删除或归档；把它和控制面的「撤回发布」当成一回事（撤回除了下线，还要注销工具）
 
 **Environment Variable（环境变量）**:
 **Workflow Definition** 里声明的应用级只读变量，随 **Workflow Version** 一起冻结；它的值可以是一个 **Secret Placeholder**。
 _Avoid_: 把它叫「配置」（易与 Provider 配置、Capability 混淆）
 
 **Dify DSL**:
-Dify 平台导出的工作流定义文件格式（.yml）；**Workflow Definition** 的来源之一。本引擎承诺可导入执行，不承诺反向导出。
+Dify 平台导出的工作流定义文件格式（.yml，较新的版本也可以是 .ifpkg 包）；**Workflow Definition** 的来源之一。本引擎承诺可导入执行，不承诺反向导出。
+
+**Canvas Graph（画布图）**:
+dsh 控制面里由画布编辑、按用户存档的工作流格式：一张平铺的节点与边组成的图，有自己的节点种类和表达式写法。它是编辑和存档的对象，不是引擎的定义；进入引擎之前由控制面转换成 **Workflow Definition**。
+_Avoid_: 把画布图叫工作流定义；把它的「节点」和 Dify 的节点混为一谈
 
 ### 执行与隔离
 
 **Invocation（调用实例）**:
 某 **Workflow Version** 的一次具体执行。引擎分配的 `invocation_id`（即 call-id）是其唯一标识与隔离边界：变量上下文、超时、取消、日志、token 统计均按 Invocation 切分。
-_Avoid_: call、run、执行实例、session run
+_Avoid_: call、run、执行实例、session run；把它和 dsh 工具调用的 `callId` 混为一谈（后者由模型提供方签发，可能是空串或重复）
 
 **Node Run（节点执行）**:
 一个节点在一次 **Invocation** 的一个作用域里的一次执行：迭代的一个元素、循环的一轮各算一次，重试算同一次。容器（迭代、循环）本身也是一次节点执行，其内部节点的执行从属于它。
@@ -35,7 +43,7 @@ _Avoid_: 节点实例；用 (invocation_id, node_id) 或 attempt 充当执行身
 上游业务传入的可选键；同一键的重复提交指向同一 Invocation，不产生新执行。
 
 **Tenant（租户）**:
-Invocation 的归属组织，隔离与统计的最高切分维度；其下还有人员维度 user_id。
+Invocation 的归属组织，隔离与统计的最高切分维度；其下还有人员维度 user_id。本期它是部署级的固定值，由环境变量配置。
 _Avoid_: 用户（易与 user_id 混淆）
 
 **Control Plane（控制面）**:
@@ -48,6 +56,10 @@ _Avoid_: 执行器（泛称，不作为组件名）
 **Session（dsh 会话）**:
 控制面里用户与 agent 的一次持续交互；agent 在其中可以调用多个工具，其中包括多个工作流。属于 **Control Plane**，不属于引擎。
 _Avoid_: 把 Session 叫 Conversation
+
+**Session Variable（dsh 会话变量）**:
+dsh 的功能：一个 **Session** 里，agent 和这个会话调用的各个工作流共享的一组字符串变量，由 dsh 的会话变量插件持有，工作流经 dsh 的接口读写。它不属于引擎，和 **Conversation** 的会话变量是两个概念。
+_Avoid_: 把它叫「会话变量」（在本文档里那是 Conversation 的变量）；把它和 Conversation Variable 混用
 
 ### 节点与集成
 
@@ -84,7 +96,7 @@ _Avoid_: 把它和 dsh 会话的上下文混为一谈
 父 Invocation 经 sub-workflow 节点派生的子 Invocation；完成后结果回传父级，是跨 Invocation 数据交互的正规通道。
 
 **Human-Input Node**:
-暂停 **Invocation**、等待用户审批或表单输入后继续的节点；动作分支 + 超时分支，语义与 Dify human-input 对齐。
+让执行到它的那一路停下来，等用户审批或表单输入后再继续的节点；动作分支 + 超时分支，语义与 Dify human-input 对齐。并行的其它分支照常执行，这一点与 Dify 不同（D75）。
 
 **Trigger（触发器）**:
 工作流的入口事件（定时/webhook/插件事件）；归属 **Control Plane**，引擎仅接收统一 API 触发。

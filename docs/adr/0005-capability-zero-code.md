@@ -5,3 +5,5 @@
 ## 修订
 
 - 2026-11-26：原文「Capability 密钥 AES-GCM 加密落库」作废——密钥统一走占位符，AES-GCM 密钥库只在 local 部署档位存在（grill Round 5 U9）。
+- 2026-11-26：Office 文档服务按本 ADR 接入——独立的 HTTP 服务，接口注册成 Capability，工作流里用 http-tool 节点引用；专用节点类型以后再加，届时绑定到这个 Capability（grill Round 9 Y1）。
+- 2026-11-26：后端的响应和节点的输出契约不一致时，在后端前面放一个 HTTP 适配服务，Capability 指向适配服务，Capability 的定义里不做响应变换（grill Round 11 AA1）。
