@@ -1,4 +1,4 @@
-# A. Dify 节点映射表（修订稿，对应 D1–D75）
+# A. Dify 节点映射表（修订稿，对应 D1–D84）
 
 > **版本策略**（D42、D60）：接受 DSL `0.1.5` 至 `0.7.0`，导入期做归一化；比 0.7.0 新的文件照常导入，报告置顶一条警告；低于 0.1.5 的拒绝。接受 `.yml` 和 `.ifpkg`（zip，解包取 DSL）。无论版本号是多少，都按节点 `data.type` 对照本表校验——版本号和内容不可靠地对应。下限不是硬需求：实现期如果 0.1.5 的归一化成本偏高，可以把下限抬到 0.2.0，不需要重新决策。
 > **兼容性总原则**：节点 id 原样保留。输出节点的 type 仍是 `end`，源码里没有 `output` 这个类型，`output` 只作防御性别名接受。子图节点（React Flow 的 `parentId` 挂接）归一为引擎的容器节点；容器里每一次节点执行都有自己的 `node_run_id`（D38）。
@@ -64,7 +64,7 @@ LLM 节点的三个要点：
 | `tool` | 工具 | 调插件工具 | `api` 映射 Capability；`mcp` 走远程 MCP 客户端；`builtin` 常用子集按需，其余占位；`workflow` 映射 sub-workflow（Round 12 的默认处理） | 每个工具可单独绑定（实例级） | 分级 |
 | `human-input` | 人工介入 | 暂停，等人填表单或审批 | 这一路挂起落库，提交后这一路继续跑；并行的其它分支照常执行（D75，这一点与 Dify 不同，Dify 是整条工作流停住，待核实）。**两级时限**：提醒时限到了发提醒事件，超时时限到了走 `__timeout` 分支。可选的 `assignees`。循环里每一轮的等待各是一条记录 | 可绑定（审批后端） | 全量 |
 
-human-input 的说明：Dify 没有审批人模型，谁拿到表单 token 谁就能提交，`delivery_methods` 的接收人只是投递目标。`assignees` 是本引擎的扩展，权限校验仍在控制面。dsh 画布的 `userinput` 节点经转换器落到这里（D67）。
+human-input 的说明：Dify 没有审批人模型，谁拿到表单 token 谁就能提交，`delivery_methods` 的接收人只是投递目标。`assignees` 是本引擎的扩展，权限校验仍在控制面。dsh 画布的 `userinput` 节点经转换器落到这里（D67）。并行分支里可以同时有多处人工输入在等人，每处各是一条等待记录、各是一张卡；引擎把它们都照常发出来，同时只显示哪一张是控制面的显示规则（D84，见 `docs/api-spec.md` 的契约要点）。
 
 ## 6. 应用类型
 
@@ -92,7 +92,7 @@ human-input 的说明：Dify 没有审批人模型，谁拿到表单 token 谁�
 | `sub-workflow` | 父 Invocation 经它派生子 Invocation，结果回传；嵌套深度默认上限 5；父节点重跑时不重复派生 | 全量 |
 | `http-tool` | 引用 Capability 的节点，与 http-request 并存 | 全量 |
 | （dsh 会话变量，没有专用节点） | 画布的 `vars` 节点经转换器变成 `http-tool`，引用指向 dsh 会话变量接口的预置 Capability（部署时写入的种子记录），执行时带上会话引用。变量桶由 dsh 保管，不进引擎（D73） | 全量（经 Capability） |
-| （Office 文档，没有专用节点） | Office 文档的生成和编辑经 Capability + `http-tool` 接入：文档服务是独立的 HTTP 服务（D64）。本期支持模板填充、从零生成、编辑既有文件，格式转换后置（D66）。实现语言待定（`docs/open-issues.md` 的 OI-003）。以后要加专用节点时，它绑定到这个 Capability | 本期（实现语言待定） |
+| （Office 文档，没有专用节点） | Office 文档的生成和编辑经 Capability + `http-tool` 接入：文档服务是独立的 HTTP 服务（D64）。一种操作一个接口，共五种——填充、生成、编辑、把 Markdown 排版成 Word、查询模板的占位符（D76、D82）；模板是引擎文件存储里一类带名字的文件（D77）；默认出错即失败，「允许留空」时缺值填 `{{EMPTY}}`（D80）。格式转换后置（D66）。实现语言待定（`docs/open-issues.md` 的 OI-003）。以后要加专用节点时，它绑定到这些 Capability | 本期（实现语言待定） |
 
 ## 9. 节点错误处理（D19）
 

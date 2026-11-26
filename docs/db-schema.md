@@ -1,6 +1,6 @@
-# B. 数据库 Schema（修订稿，对应 D1–D75）
+# B. 数据库 Schema（修订稿，对应 D1–D84）
 
-> 依据：D3、D7、D33–D38、D40、D43、D45、D46、D48、D50、D53–D58、D61、D63、D65、D68–D70、D73–D75，以及各轮的默认处理。决策原文见 `docs/grill-record.md`。
+> 依据：D3、D7、D33–D38、D40、D43、D45、D46、D48、D50、D53–D58、D61、D63、D65、D68–D70、D73–D75、D77、D81、D82、D84，以及各轮的默认处理。决策原文见 `docs/grill-record.md`。
 > 原则：utf8mb4；主键 UUID（引擎生成）；JSON 列用 MySQL `JSON`；跨服务不建物理外键；高频表按月分区预留。`tenant_id` 是环境变量配置的部署级固定值，引擎库里没有租户主数据（D68）。
 > 执行用的配置只存引擎库，控制面经引擎的管理 API 读写（D34，ADR-0013）。引擎库和 dsh 自己的库分开，可以同实例，不建外键（Round 10 的默认处理）。
 > 凡是「一次节点执行」都用 `node_run_id` 标识（D38）：迭代的一个元素、循环的一轮各算一次，重试算同一次。
@@ -124,7 +124,18 @@ events (                                   -- 只有结构性事件落库
 
 - 节点开始时先写一行 `status = running` 再执行。进程重启后，`status = running` 的行就是在途节点，按配置的在途策略处理（本期：重跑，ADR-0011）。`status = waiting` 的行是挂在等待上的节点，保持等待，不重跑。
 - 「在等人」按等待记录判断，不按调用状态（D75）：一路在等人、另一路在跑时，调用是 `running`，但 `waiting_inputs` 里有一条 `status = waiting` 的记录。找回待答卡、判断一个会话里有没有等人输入的调用（D72），都查 `waiting_inputs.status = 'waiting'`，可以经 `invocations.session_ref` 定位到会话。
-- 状态怎么取（D75）：只要有节点在执行，Invocation 就是 `running`；能执行的节点都执行完、只剩等人输入时，才是 `waiting_input`。每一路的等待各自是一条等待记录；没被等待挡住的分支照常推进。多入边的节点要等所有入边所在的分支都完成才调度，包括其中等人输入的那一支；被跳过的分支算完成。
+- 一个会话同时只有一个等人输入的**调用**（D72）。一个**调用**里可以同时有多条等待记录（并行分支里两路各在等人）；同时显示给用户的只有一张卡，按等待记录产生的时间先产生的先显示，前一张被提交或超时之后才显示下一张（D84）。排队等显示的那些等待记录照常计各自的提醒时限和超时时限。
+- 状态怎么取（D75）：只要有节点在执行，Invocation 就是 `running`；能执行的节点都执行完、只剩等人输入时，才是 `waiting_input`。每一路的等待各自是一条等待记录；没被等待挡住的分支照常推进。
+- 汇合点什么时候开始（D75）：有两条以上入边的节点，要等每一条入边都「到齐」才开始。分两种情况：
+
+  ```
+          ┌──→ B（判断没选它，不会跑）──┐
+    A ──→ 判断                           └──→ D（汇合点）
+          └──→ C（判断选了它，在跑）  ───┘
+  ```
+
+  - 入边所在的分支**真的要跑**，比如 C 还在跑，或者在等确认卡：D 等它。
+  - 入边所在的分支**根本不会跑**，比如 B 是判断没选中的那一路：它对 D 算「到齐」，D 不等它。不等的话 D 永远开始不了。
 - 暂停期间，等待记录的 `remind_at`、`timeout_at` 停表；恢复时按暂停的时长顺延（Round 12 的默认处理）。
 - 幂等键随节点执行下发：HTTP 出站请求带上由 `node_run_id` 派生的幂等头。
 - `llm_delta`、`answer_delta` 不写 `events` 表（D37，ADR-0012）。序号来自同一个计数器，流式增量也占号；重启后从库里该 Invocation 的最大序号续（Round 12 的默认处理）。
@@ -235,25 +246,29 @@ node_bindings (
 
 这张表存的是配置。类型级绑定只对配置里不带目标地址的节点类型开放（knowledge-retrieval、document-extractor、code、template-transform、human-input）。发布时把解析结果写进 `workflow_versions.resolved_bindings`，之后改绑定不影响已发布的版本。
 
-## 6. 文件（D57、D61、D65）
+## 6. 文件（D57、D61、D65、D77）
 
 ```sql
 files (
   id            UUID PK,
   tenant_id     VARCHAR(64) NOT NULL,
   invocation_id UUID NULL,                -- 由哪次调用产出；控制面上传的为空
-  name          VARCHAR(255) NOT NULL,
+  kind          ENUM('uploaded','produced','template') NOT NULL DEFAULT 'uploaded',
+                                           -- template：文档模板，有名字，跨工作流复用，不随调用过期（D77）
+  name          VARCHAR(255) NOT NULL,    -- 文件名；kind=template 时也是画布上显示的名字
   mime_type     VARCHAR(128) NOT NULL,
   size          BIGINT NOT NULL,
   storage_key   VARCHAR(512) NOT NULL,    -- 文件存储里的键，前缀按租户和 Invocation 划分
   sha256        CHAR(64) NULL,
   created_at,
-  expires_at                              -- 文件默认留 7 天（产出文件和控制面上传的入参文件）
+  expires_at                              -- uploaded 和 produced 默认留 7 天；template 为空
 )
-index: (tenant_id, created_at), (invocation_id), (expires_at)
+index: (tenant_id, created_at), (invocation_id), (expires_at), (tenant_id, kind, name)
 ```
 
 File 在变量里一律是引用：`{name, mime_type, size, url}`。文件存储是可插拔的（对象存储；本地开发用本地目录）。文件怎么在一次 HTTP 调用里进出，见 `docs/api-spec.md` 的第 5 节（D65）：小文件内联，大文件用预签名地址。预签名要求存储支持；本地目录的开发档位下，由引擎提供带令牌的上传和下载端点。
+
+模板（`kind = template`）是文档服务做模板填充和「Markdown 排版成 Word」时用的版式文件（D77、D82）。它存在引擎这边，文档服务不自己做模板管理；调用时引擎按 D65 把它传给文档服务。同一个租户下模板按名字唯一。模板改了之后，正在用它的已发布工作流是立刻用新内容、还是要重新发布才生效，还没有定（`docs/open-issues.md` 的 OI-126）。
 
 ## 7. token 统计（D18）
 
